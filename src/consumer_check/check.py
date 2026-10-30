@@ -12,8 +12,9 @@
    one image, and waits until every service is healthy.
 4. Asserts, on ``POST /invoke``: tenant A's key gets ``401`` from tenant B's process and
    ``200`` from A's, whose output is the scripted gateway's answer; the same the other way
-   round; and the scripted gateway answered exactly one model call per tenant, each with
-   that tenant's own gateway token.
+   round; that the scripted gateway answered exactly one model call per tenant, each with
+   that tenant's own gateway token; and that the gateway itself refuses a model call with a
+   random token or with none (``401``), counting neither.
 5. Tears the project down (``docker compose down -v``) whatever happened, and exits
    non-zero on any failure.
 
@@ -37,8 +38,6 @@ from pathlib import Path
 from typing import Any, Final
 from urllib.parse import parse_qs, urlsplit
 
-from consumer_check.scripted_gateway import ANSWER, CALLS_PATH
-
 ROOT: Final = Path(__file__).resolve().parents[2]
 RUN_DIR: Final = ROOT / ".run"
 SECRETS_DIR: Final = RUN_DIR / "secrets"
@@ -52,7 +51,17 @@ GATEWAY_SERVICE: Final = "scripted-gateway"
 CALLER: Final = "consumer-check"
 WAIT_SECONDS: Final = 180
 HTTP_TIMEOUT_SECONDS: Final = 30
-EXPECTED_OUTPUT: Final = {"answer": ANSWER}
+#: What a 200 from ``POST /invoke`` must carry: the scripted gateway's answer, spelled out
+#: here rather than imported, so a change on the gateway's side fails the check.
+EXPECTED_OUTPUT: Final = {"answer": "synthetic answer from the scripted gateway"}
+#: The scripted gateway's chat route and its call counts, as the agents and the run see them.
+GATEWAY_CHAT_PATH: Final = "/v1/chat/completions"
+GATEWAY_CALLS_PATH: Final = "/_scripted/calls"
+#: A chat call the run sends to the gateway itself, to see it refused.
+PROBE_CHAT: Final = {
+    "model": "scripted-chat-model",
+    "messages": [{"role": "user", "content": "a probe that must be refused"}],
+}
 
 
 class CheckFailedError(Exception):
@@ -233,14 +242,44 @@ def assert_isolation(results: Results, keys: Mapping[str, str]) -> None:
             "scripted gateway's answer",
             f"got {status}, output {'matches' if output == EXPECTED_OUTPUT else 'differs'}",
         )
-    gateway = published_port(GATEWAY_SERVICE)
-    status, body = request("GET", f"http://127.0.0.1:{gateway}{CALLS_PATH}")
-    calls = body.get("calls") if isinstance(body, dict) else None
+    gateway = f"http://127.0.0.1:{published_port(GATEWAY_SERVICE)}"
+    calls = gateway_calls(gateway)
     results.check(
-        status == 200 and calls == dict.fromkeys(TENANTS, 1),
+        calls == dict.fromkeys(TENANTS, 1),
         "the scripted gateway answered one model call per tenant, each with that tenant's "
         "own gateway token; the refused calls reached no model",
         f"calls by token: {calls}",
+    )
+    assert_gateway_refuses(results, gateway)
+
+
+def gateway_calls(gateway: str) -> dict[str, int] | None:
+    """The scripted gateway's answered model calls by token label, or ``None``."""
+    status, body = request("GET", gateway + GATEWAY_CALLS_PATH)
+    calls = body.get("calls") if status == 200 and isinstance(body, dict) else None
+    return calls if isinstance(calls, dict) else None
+
+
+def assert_gateway_refuses(results: Results, gateway: str) -> None:
+    """The gateway itself refuses a model call without a tenant's token, and counts none.
+
+    One call carries a fresh random token, one no ``Authorization`` header; both must get
+    ``401``, and the per-token call counts must be the same afterwards.
+    """
+    before = gateway_calls(gateway)
+    probes = {"a random token": secrets.token_urlsafe(32), "no Authorization header": None}
+    for description, token in probes.items():
+        status, _ = request("POST", gateway + GATEWAY_CHAT_PATH, body=PROBE_CHAT, key=token)
+        results.check(
+            status == 401,
+            f"the scripted gateway refuses a model call with {description} with 401",
+            f"got {status}",
+        )
+    after = gateway_calls(gateway)
+    results.check(
+        before is not None and after == before,
+        "the refused gateway calls changed no per-token call count",
+        f"calls by token: {after}",
     )
 
 

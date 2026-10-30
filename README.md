@@ -22,6 +22,7 @@ The wm-agents CI runs the check on every library pull request from WMA-197 on.
 | Path | Holds |
 |---|---|
 | `pyproject.toml`, `uv.lock` | The one dependency, the `v0.2.0` tag above, and its lock |
+| `constraints/wm-agents-lock.json` | wm-agents' own `uv.lock` versions at that tag, which `pyproject.toml` constrains this repo to |
 | `src/consumer_check/agent.py` | The agent module: imports only `wm_agents` (and `pydantic` for its output schema) |
 | `tenants/tenant-a/`, `tenants/tenant-b/` | The two synthetic tenant configs, each with the same agent |
 | `config/approved-models.yaml` | The synthetic approved-models list: one model, answered by the scripted gateway |
@@ -48,8 +49,9 @@ The script:
    published port on `127.0.0.1`) and waits until all three are healthy;
 4. checks, on `POST /invoke`, that each tenant's key is refused with `401` by the other
    tenant's process and answered with `200` and the scripted gateway's answer by its own,
-   and that the scripted gateway answered one model call per tenant, each with that
-   tenant's own gateway token;
+   that the scripted gateway answered one model call per tenant, each with that tenant's
+   own gateway token, and that the gateway refuses a model call with a random token or with
+   none (`401`) without counting it;
 5. runs `docker compose down -v`, whatever happened, and exits non-zero on any failure.
 
 Each agent container gets only settings from the wm-agents shared contract:
@@ -67,7 +69,22 @@ uv run mypy --strict .
 uv run pytest
 ```
 
-On a new library tag, change the tag in `pyproject.toml` and `tests/test_check.py`, run
-`uv lock`, and run the check.
+## The same lock as wm-agents
+
+This repo resolves to the third-party versions in wm-agents' own `uv.lock` at the tag it
+installs, so the check proves the library's known-good set
+(`kb/decisions/2026-10-26-library-dependency-ranges-and-git-tag-releases.md` in wm-agents).
+`python -m consumer_check.sync_constraints` reads that lock from a local wm-agents checkout
+(`git show <tag>:uv.lock`, changing nothing there), writes the snapshot
+`constraints/wm-agents-lock.json` and the generated `[tool.uv] constraint-dependencies`
+block in `pyproject.toml`. `tests/test_constraints.py` checks that every package in both
+locks has the same version, against the committed snapshot, so it needs no wm-agents access.
+
+## On a new library tag
+
+1. Change the tag in `pyproject.toml`, the tag and commit in `tests/test_check.py`, and the tag in
+   `tests/test_constraints.py`.
+2. `uv run python -m consumer_check.sync_constraints --wm-agents <path to a wm-agents checkout>`
+3. `uv lock`, then the repo's checks and the run above.
 
 The wm-agents library repository is private, so installing from the tag needs read access to it.

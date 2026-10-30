@@ -38,3 +38,8 @@ def test_the_gateway_and_the_run_script_use_the_standard_library_only(module: st
 def test_no_module_imports_agent_core() -> None:
     for path in PACKAGE.rglob("*.py"):
         assert "agent_core" not in _imported_roots(path), path.name
+
+
+def test_the_run_script_defines_its_own_expectations() -> None:
+    """The check's expected answer and paths are its own, not the gateway module's."""
+    assert OWN not in _imported_roots(PACKAGE / "check.py")

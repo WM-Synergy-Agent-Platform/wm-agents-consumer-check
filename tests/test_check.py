@@ -31,7 +31,7 @@ def test_the_lock_pins_the_tag_s_commit() -> None:
     assert source.repository == "https://github.com/WM-Synergy-Agent-Platform/wm-agents"
     assert source.rev == "v0.2.0"
     assert source.subdirectory == "packages/agent-core"
-    assert re.fullmatch(r"[0-9a-f]{40}", source.commit)
+    assert source.commit == "74aad978e7645cec609627f6969dc51ddc742e8f"
 
 
 def test_the_agent_is_defined_through_wm_agents() -> None:
