@@ -1,0 +1,10 @@
+# Synthetic tenant for the consumer check.
+schema_version: 1
+tenant_id: tenant-b
+environment: local
+model_routes:
+  default: scripted-chat-model
+agents:
+  consumer-agent:
+    version: 0.1.0
+    config: agents/consumer-agent.yaml

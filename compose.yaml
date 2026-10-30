@@ -1,0 +1,101 @@
+# The consumer check: one image, two agent processes (tenant-a, tenant-b) and the scripted
+# gateway. Run it with `uv run python -m consumer_check.check`, which generates the files
+# under .run/ first and tears everything down afterwards; Compose alone can't start it.
+#
+# Each agent gets only settings from wm-agents' shared contract
+# (docs/plans/PLAN-platform-foundation.md). OTEL_EXPORTER_OTLP_ENDPOINT is unset, so spans
+# are created and exported nowhere. Published ports are bound to 127.0.0.1, on a port
+# Docker picks.
+name: wma191
+
+x-agent: &agent
+  image: wma191/consumer-check:local
+  pull_policy: never
+  command: ["python", "-m", "consumer_check.agent"]
+  depends_on:
+    scripted-gateway:
+      condition: service_healthy
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"
+    interval: 2s
+    timeout: 3s
+    retries: 30
+  ports:
+    - "127.0.0.1::8080"
+
+services:
+  scripted-gateway:
+    image: wma191/consumer-check:local
+    pull_policy: build
+    build:
+      context: .
+      additional_contexts:
+        wheelhouse: ./.run/wheelhouse
+    command:
+      - python
+      - -m
+      - consumer_check.scripted_gateway
+      - --port=8080
+      - --token=tenant-a=/run/secrets/tenant-a-gateway-token
+      - --token=tenant-b=/run/secrets/tenant-b-gateway-token
+    secrets:
+      - tenant-a-gateway-token
+      - tenant-b-gateway-token
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1::8080"
+
+  agent-tenant-a:
+    <<: *agent
+    environment:
+      WM_TENANT_FILE: /opt/consumer/tenants/tenant-a/tenant.yaml
+      WM_APPROVED_MODELS_FILE: /opt/consumer/approved-models.yaml
+      WM_AGENT_NAME: consumer-agent
+      WM_API_KEYS_FILE: /run/secrets/api-keys
+      WM_GATEWAY_URL: http://scripted-gateway:8080
+      WM_GATEWAY_CREDENTIAL: local-token
+      WM_GATEWAY_TOKEN_FILE: /run/secrets/gateway-token
+    secrets:
+      - source: tenant-a-api-keys
+        target: api-keys
+      - source: tenant-a-gateway-token
+        target: gateway-token
+
+  agent-tenant-b:
+    <<: *agent
+    environment:
+      WM_TENANT_FILE: /opt/consumer/tenants/tenant-b/tenant.yaml
+      WM_APPROVED_MODELS_FILE: /opt/consumer/approved-models.yaml
+      WM_AGENT_NAME: consumer-agent
+      WM_API_KEYS_FILE: /run/secrets/api-keys
+      WM_GATEWAY_URL: http://scripted-gateway:8080
+      WM_GATEWAY_CREDENTIAL: local-token
+      WM_GATEWAY_TOKEN_FILE: /run/secrets/gateway-token
+    secrets:
+      - source: tenant-b-api-keys
+        target: api-keys
+      - source: tenant-b-gateway-token
+        target: gateway-token
+
+# Generated per run by consumer_check.check into the gitignored .run/secrets; never committed.
+secrets:
+  tenant-a-api-keys:
+    file: ./.run/secrets/tenant-a-api-keys.json
+  tenant-b-api-keys:
+    file: ./.run/secrets/tenant-b-api-keys.json
+  tenant-a-gateway-token:
+    file: ./.run/secrets/tenant-a-gateway-token
+  tenant-b-gateway-token:
+    file: ./.run/secrets/tenant-b-gateway-token

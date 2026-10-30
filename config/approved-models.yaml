@@ -1,0 +1,8 @@
+# Synthetic approved-models list for the consumer check. The one model is answered by the
+# scripted gateway (src/consumer_check/scripted_gateway.py); no real model is called.
+schema_version: 2
+models:
+  scripted-chat-model:
+    api: openai-chat
+    provider: ollama
+    environments: [local]
