@@ -1,0 +1,10 @@
+# The build context is only what the Dockerfile copies. .run/ (generated keys, tokens and
+# the wheelhouse) never enters it: the wheelhouse arrives as its own named context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!config/
+!tenants/
+**/__pycache__

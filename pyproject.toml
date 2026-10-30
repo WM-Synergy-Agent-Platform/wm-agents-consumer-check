@@ -1,0 +1,44 @@
+[project]
+name = "wm-agents-consumer-check"
+version = "0.1.0"
+description = "Proves the wm-agents public API from outside the monorepo (Gate 1, WMA-191)."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "wm-agents @ git+https://github.com/WM-Synergy-Agent-Platform/wm-agents@v0.2.0#subdirectory=packages/agent-core",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "consumer_check"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["kb", ".run"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+exclude = ['^\.run/', '^\.venv/']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib", "--strict-markers"]

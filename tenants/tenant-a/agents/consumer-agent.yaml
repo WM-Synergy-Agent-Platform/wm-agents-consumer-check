@@ -1,0 +1,4 @@
+model_route: default
+client_prompt: |
+  Answer in one short sentence.
+tools: []
