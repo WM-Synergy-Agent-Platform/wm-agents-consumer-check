@@ -15,7 +15,8 @@ and imports only `wm_agents`, never `agent_core`. It serves one agent as two ten
 (`tenant-a`, `tenant-b`) and checks that each tenant's key is refused by the other tenant's
 process.
 
-The wm-agents CI runs the check on every library pull request from WMA-197 on.
+The wm-agents CI (`consumer-check`, WMA-197) runs the check on every library pull request,
+in the local-library mode below, against the pull request's own checkout.
 
 ## What is here
 
@@ -28,7 +29,7 @@ The wm-agents CI runs the check on every library pull request from WMA-197 on.
 | `config/approved-models.yaml` | The synthetic approved-models list: one model, answered by the scripted gateway |
 | `src/consumer_check/scripted_gateway.py` | The scripted model gateway (standard library only); no model is ever called |
 | `Dockerfile`, `compose.yaml` | One image; two agent containers and the scripted gateway |
-| `src/consumer_check/check.py` | The run script |
+| `src/consumer_check/check.py` | The run script, from the tag or, with `--library`, from a wm-agents checkout |
 
 ## Running the check
 
@@ -67,6 +68,40 @@ uv run ruff check
 uv run ruff format --check
 uv run mypy --strict .
 uv run pytest
+```
+
+## Local-library mode: a wm-agents checkout instead of the tag
+
+The wm-agents CI runs the same check against a pull request's library, which has no tag yet:
+
+```bash
+uv run python -m consumer_check.check --library <path to a wm-agents checkout>
+```
+
+It clones nothing and checks no commit. It:
+
+1. builds the wm-agents wheel from the checkout's `packages/agent-core`;
+2. makes a run-scoped copy of this project in the gitignored `.run/library`: the Dockerfile,
+   the Compose file, `src/`, `tests/`, `config/`, `tenants/` and the README, byte for byte,
+   and a `pyproject.toml` that installs wm-agents from that wheel (through
+   `[tool.uv.sources]`) instead of the tag, with the generated constraint block rewritten
+   from the **checkout's** `uv.lock`;
+3. runs `uv lock` in the copy, and fails unless every third-party package in the copy's lock
+   is at the checkout lock's version;
+4. generates the keys and tokens into `.run/library/.run/secrets`, starts the same Compose
+   project from the copy and makes the same eight assertions; then tears down as above.
+
+The committed `pyproject.toml`, `uv.lock` and `constraints/wm-agents-lock.json` are never
+written: only `.run/library` is. With no option, the run is the tag run above, unchanged.
+
+`--prepare-only` stops after step 3, before Docker, so the copy can be checked first, as CI
+does. The checkout needs no git access, and neither does the copy, so CI starts the script
+without syncing this project (which would fetch the private tag):
+
+```bash
+PYTHONPATH=src uv run --no-project python -m consumer_check.check --library <checkout> --prepare-only
+cd .run/library && uv sync --locked && uv run mypy --strict . && uv run ruff check && cd -
+PYTHONPATH=src uv run --no-project python -m consumer_check.check --library <checkout>
 ```
 
 ## The same lock as wm-agents

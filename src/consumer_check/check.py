@@ -18,11 +18,25 @@
 5. Tears the project down (``docker compose down -v``) whatever happened, and exits
    non-zero on any failure.
 
+The local-library mode (WMA-197), for the wm-agents CI and for trying a library change:
+
+    python -m consumer_check.check --library <path to a wm-agents checkout>
+
+It runs the same assertions against the library as that checkout holds it, not the tag. It
+clones nothing and checks no commit: it builds the wheel from the checkout's
+``packages/agent-core``, and constrains this repo's third-party dependencies to the
+checkout's own ``uv.lock``. Nothing committed here changes. The run works in a run-scoped
+copy of this project, ``.run/library`` (gitignored), whose ``pyproject.toml`` installs
+wm-agents from that wheel and pins the checkout's lock, and which ``uv lock`` re-locks;
+the Compose project starts from that copy. ``--prepare-only`` stops once the copy is
+locked, so ``uv sync``, ``mypy`` and ``ruff`` can run in it first.
+
 Standard library only.
 """
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import secrets
@@ -38,11 +52,26 @@ from pathlib import Path
 from typing import Any, Final
 from urllib.parse import parse_qs, urlsplit
 
+from consumer_check.sync_constraints import library_manifest, lock_differences, lock_versions
+
 ROOT: Final = Path(__file__).resolve().parents[2]
 RUN_DIR: Final = ROOT / ".run"
 SECRETS_DIR: Final = RUN_DIR / "secrets"
 WHEELHOUSE: Final = RUN_DIR / "wheelhouse"
 CLONE_DIR: Final = RUN_DIR / "build" / "wm-agents"
+#: The local-library mode's run-scoped copy of this project (gitignored, under ``.run``).
+LIBRARY_DIR: Final = RUN_DIR / "library"
+#: What the copy holds: everything the image, Compose, ``mypy`` and ``ruff`` read.
+LIBRARY_FILES: Final = (
+    "Dockerfile",
+    "compose.yaml",
+    ".dockerignore",
+    ".python-version",
+    "README.md",
+)
+LIBRARY_TREES: Final = ("src", "tests", "config", "tenants")
+#: The wm-agents package in a wm-agents checkout.
+LIBRARY_MEMBER: Final = "packages/agent-core"
 PROJECT: Final = "wma191"
 TENANTS: Final = ("tenant-a", "tenant-b")
 AGENT_SERVICES: Final = {"tenant-a": "agent-tenant-a", "tenant-b": "agent-tenant-b"}
@@ -127,11 +156,11 @@ def write_secrets(directory: Path, tenants: Sequence[str]) -> dict[str, str]:
     return keys
 
 
-def _run(command: Sequence[str], *, quiet: bool = False) -> str:
-    """Run ``command`` in the repo root; return its standard output, or raise naming it."""
+def _run(command: Sequence[str], *, quiet: bool = False, cwd: Path = ROOT) -> str:
+    """Run ``command`` in ``cwd`` (the repo root by default); return its standard output."""
     result = subprocess.run(  # noqa: S603 - fixed commands, no shell
         list(command),
-        cwd=ROOT,
+        cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL if quiet else None,
         text=True,
@@ -173,13 +202,80 @@ def build_wheelhouse(source: LockedSource) -> Path:
     return wheels[0]
 
 
-def compose(*args: str, quiet: bool = False) -> str:
-    return _run(["docker", "compose", "--project-name", PROJECT, *args], quiet=quiet)
+def _checkout_commit(checkout: Path) -> str:
+    """The checkout's ``HEAD`` commit, for the log only; the run checks no commit."""
+    try:
+        return _run(["git", "-C", str(checkout), "rev-parse", "HEAD"], quiet=True).strip()
+    except CheckFailedError:
+        return "not a git checkout"
 
 
-def published_port(service: str) -> int:
+def prepare_library(checkout: Path) -> Path:
+    """Make ``LIBRARY_DIR``, this project against the wm-agents ``checkout``; return the wheel.
+
+    Copies what the image, Compose, ``mypy`` and ``ruff`` read into the run-scoped
+    ``LIBRARY_DIR``; builds the wm-agents wheel from the checkout into its
+    ``.run/wheelhouse``; writes its ``pyproject.toml`` to install that wheel and pin the
+    checkout's ``uv.lock``; re-locks it; and fails unless every third-party package in the
+    new lock is at the checkout lock's version. Nothing outside ``LIBRARY_DIR`` is written.
+    """
+    checkout = checkout.resolve()
+    lock = checkout / "uv.lock"
+    member = checkout / LIBRARY_MEMBER
+    if not (lock.is_file() and (member / "pyproject.toml").is_file()):
+        raise CheckFailedError(f"{checkout} has no uv.lock or {LIBRARY_MEMBER}: not wm-agents")
+    try:
+        reference = lock_versions(lock)
+    except ValueError as error:
+        raise CheckFailedError(f"the checkout's uv.lock: {error}") from None
+    commit = _checkout_commit(checkout)
+    print(f"wm-agents: the library checkout at {checkout} ({commit[:12]}), not the tag")
+    shutil.rmtree(LIBRARY_DIR, ignore_errors=True)
+    LIBRARY_DIR.mkdir(parents=True)
+    for name in LIBRARY_FILES:
+        shutil.copy2(ROOT / name, LIBRARY_DIR / name)
+    for name in LIBRARY_TREES:
+        ignore = shutil.ignore_patterns("__pycache__")
+        shutil.copytree(ROOT / name, LIBRARY_DIR / name, ignore=ignore)
+    wheelhouse = LIBRARY_DIR / ".run" / "wheelhouse"
+    _run(["uv", "build", "--quiet", "--wheel", "--out-dir", str(wheelhouse), str(member)])
+    wheels = sorted(wheelhouse.glob("wm_agents-*.whl"))
+    if len(wheels) != 1:
+        raise CheckFailedError(f"expected one wm-agents wheel, built {len(wheels)}")
+    print(f"built {wheels[0].name} from the checkout into .run/library/.run/wheelhouse")
+    try:
+        manifest = library_manifest(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+            wheel=wheels[0].relative_to(LIBRARY_DIR).as_posix(),
+            versions=reference,
+            checkout=str(checkout),
+            commit=commit,
+        )
+    except ValueError as error:
+        raise CheckFailedError(str(error)) from None
+    (LIBRARY_DIR / "pyproject.toml").write_text(manifest, encoding="utf-8")
+    _run(["uv", "lock"], cwd=LIBRARY_DIR)
+    locked = lock_versions(LIBRARY_DIR / "uv.lock")
+    differing = lock_differences(reference, locked)
+    if differing:
+        raise CheckFailedError(
+            f"{len(differing)} package(s) in .run/library/uv.lock are not at the checkout "
+            f"lock's version: {', '.join(differing)}"
+        )
+    print(
+        f"locked .run/library to the checkout's uv.lock: {len(locked)} third-party "
+        "packages, 0 at another version"
+    )
+    return wheels[0]
+
+
+def compose(*args: str, quiet: bool = False, cwd: Path = ROOT) -> str:
+    return _run(["docker", "compose", "--project-name", PROJECT, *args], quiet=quiet, cwd=cwd)
+
+
+def published_port(service: str, cwd: Path = ROOT) -> int:
     """The 127.0.0.1 port Docker published for ``service``'s 8080."""
-    address = compose("port", service, "8080").strip()
+    address = compose("port", service, "8080", cwd=cwd).strip()
     host, _, port = address.rpartition(":")
     if host != "127.0.0.1":
         raise CheckFailedError(f"{service} is published on {host}, not 127.0.0.1")
@@ -224,9 +320,9 @@ def invoke(port: int, key: str) -> tuple[int, Any]:
     return request("POST", url, body={"input": "What is the answer?"}, key=key)
 
 
-def assert_isolation(results: Results, keys: Mapping[str, str]) -> None:
+def assert_isolation(results: Results, keys: Mapping[str, str], cwd: Path = ROOT) -> None:
     """The cross-tenant 401s, the same-tenant 200s and the gateway's call counts."""
-    ports = {tenant: published_port(service) for tenant, service in AGENT_SERVICES.items()}
+    ports = {tenant: published_port(service, cwd) for tenant, service in AGENT_SERVICES.items()}
     for tenant, other in ((TENANTS[0], TENANTS[1]), (TENANTS[1], TENANTS[0])):
         status, _ = invoke(ports[other], keys[tenant])
         results.check(
@@ -242,7 +338,7 @@ def assert_isolation(results: Results, keys: Mapping[str, str]) -> None:
             "scripted gateway's answer",
             f"got {status}, output {'matches' if output == EXPECTED_OUTPUT else 'differs'}",
         )
-    gateway = f"http://127.0.0.1:{published_port(GATEWAY_SERVICE)}"
+    gateway = f"http://127.0.0.1:{published_port(GATEWAY_SERVICE, cwd)}"
     calls = gateway_calls(gateway)
     results.check(
         calls == dict.fromkeys(TENANTS, 1),
@@ -283,20 +379,45 @@ def assert_gateway_refuses(results: Results, gateway: str) -> None:
     )
 
 
-def _print_logs() -> None:
+def _print_logs(cwd: Path = ROOT) -> None:
     """The services' last log lines, for a failed run. Agent logs are JSON with no secret."""
     print("--- docker compose logs (tail) ---", flush=True)
     subprocess.run(  # noqa: S603 - fixed command, no shell
         ["docker", "compose", "--project-name", PROJECT, "logs", "--no-color", "--tail=40"],  # noqa: S607
-        cwd=ROOT,
+        cwd=cwd,
         check=False,
     )
 
 
-def run() -> int:
+def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m consumer_check.check",
+        description="The Gate 1 run. With no option: wm-agents from the tag uv.lock pins.",
+    )
+    parser.add_argument(
+        "--library",
+        type=Path,
+        metavar="CHECKOUT",
+        help="a wm-agents checkout: build the wheel from it and constrain to its uv.lock",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="with --library: stop once .run/library is locked, before Docker",
+    )
+    options = parser.parse_args(argv)
+    if options.prepare_only and options.library is None:
+        parser.error("--prepare-only needs --library")
+    return options
+
+
+def run(argv: Sequence[str] | None = None) -> int:
     """The whole run; the exit code is 1 on any failure."""
+    options = _arguments(argv)
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(line_buffering=True)  # keep the PASS lines in order
+    if options.library is not None:
+        return run_library(options.library, prepare_only=options.prepare_only)
     results = Results()
     started = False
     try:
@@ -330,5 +451,43 @@ def run() -> int:
     return 1 if results.failures else 0
 
 
+def run_library(checkout: Path, *, prepare_only: bool = False) -> int:
+    """The local-library mode: the same run, from ``LIBRARY_DIR`` against ``checkout``."""
+    results = Results()
+    secrets_dir = LIBRARY_DIR / ".run" / "secrets"
+    started = False
+    try:
+        prepare_library(checkout)
+        if prepare_only:
+            print("PREPARED: .run/library is locked; nothing was started")
+            return 0
+        keys = write_secrets(secrets_dir, TENANTS)
+        print(
+            f"generated {len(keys)} inbound API keys and {len(TENANTS)} gateway tokens "
+            "into .run/library/.run/secrets (values not shown)"
+        )
+        started = True
+        compose(
+            "up", "--build", "--detach", "--wait", f"--wait-timeout={WAIT_SECONDS}", cwd=LIBRARY_DIR
+        )
+        states = compose("ps", "--format", "{{.Service}}={{.Health}}", cwd=LIBRARY_DIR).split()
+        print("services up: " + ", ".join(sorted(states)))
+        assert_isolation(results, keys, LIBRARY_DIR)
+    except CheckFailedError as error:
+        results.check(False, str(error))
+    finally:
+        if started:
+            if results.failures:
+                _print_logs(LIBRARY_DIR)
+            try:
+                compose("down", "-v", "--remove-orphans", quiet=True, cwd=LIBRARY_DIR)
+                print("torn down: docker compose down -v")
+            except CheckFailedError as error:
+                results.check(False, f"teardown: {error}")
+        shutil.rmtree(secrets_dir, ignore_errors=True)
+    print(f"{'FAILED' if results.failures else 'PASSED'}: {results.failures} failure(s)")
+    return 1 if results.failures else 0
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(run(sys.argv[1:]))
