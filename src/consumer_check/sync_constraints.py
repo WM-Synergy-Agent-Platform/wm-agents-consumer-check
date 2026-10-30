@@ -14,6 +14,10 @@ writes:
   ``name==version`` per package, so ``uv lock`` resolves to the same versions.
 
 On a new library tag: change the tag in ``pyproject.toml``, run this, then ``uv lock``.
+
+The check's local-library mode (``python -m consumer_check.check --library <checkout>``,
+WMA-197) reads a lock from a path instead, with ``lock_versions``, and builds a run-scoped
+copy of ``pyproject.toml`` with ``library_manifest``. Neither writes a committed file.
 Standard library only.
 """
 
@@ -83,6 +87,40 @@ def replace_block(text: str, block: str) -> str:
         raise ValueError("pyproject.toml's generated block markers are broken")
     after = text.find("\n", end)
     return text[:start] + block + ("" if after == -1 else text[after + 1 :])
+
+
+def lock_versions(lock: Path) -> dict[str, str]:
+    """Each registry package's version in the uv.lock file at ``lock``, not at a git ref."""
+    return registry_versions(lock.read_text(encoding="utf-8"))
+
+
+def lock_differences(reference: Mapping[str, str], versions: Mapping[str, str]) -> list[str]:
+    """Each package of ``versions`` that ``reference`` lacks or holds at another version."""
+    return sorted(name for name, version in versions.items() if reference.get(name) != version)
+
+
+def library_manifest(
+    text: str, *, wheel: str, versions: Mapping[str, str], checkout: str, commit: str
+) -> str:
+    """This repo's ``pyproject.toml`` text, rewritten for a run against a wm-agents checkout.
+
+    The wm-agents dependency on a tag becomes a plain ``wm-agents``, installed from
+    ``wheel`` (a path relative to the project, through ``[tool.uv.sources]``), and the
+    generated constraint block pins ``versions``, the checkout's own lock. Only the returned
+    text differs; the caller writes it to a run-scoped copy, never over the committed file.
+    """
+    dependencies = tomllib.loads(text)["project"]["dependencies"]
+    tag_of(dependencies)
+    [dependency] = [dep for dep in dependencies if _TAG.match(dep)]
+    quoted = f'"{dependency}"'
+    if text.count(quoted) != 1 or "[tool.uv.sources]" in text:
+        raise ValueError("pyproject.toml's wm-agents dependency can't be rewritten in place")
+    if '"' in wheel or "\\" in wheel:
+        raise ValueError(f"the wheel path {wheel!r} can't be written into TOML as it is")
+    text = text.replace(quoted, '"wm-agents"')
+    text = replace_block(text, constraint_block(versions, tag=checkout, commit=commit))
+    sources = f'[tool.uv.sources]\nwm-agents = {{ path = "{wheel}" }}\n'
+    return text.rstrip("\n") + "\n\n" + sources
 
 
 def _git(checkout: Path, *args: str) -> str:
